@@ -1,0 +1,474 @@
+================================================================
+USB 摄像头 App（Android / UVC）项目说明与需求全记录
+================================================================
+版本：v2.3.0（versionCode 5）
+最后更新：2026-10-31
+用途：交给另一个 AI / 另一个人继续开发时，保证需求与实现不跑偏。
+说明：本文是“唯一事实来源”，与代码冲突时以本文描述的行为契约 + 现有代码为准。
+
+
+================================================================
+0. 一分钟速览
+================================================================
+这是一个安卓 App，插上免驱 UVC（USB Video Class）摄像头后可以：
+全屏预览、拍照、录像、切换分辨率/格式、旋转镜像、悬浮窗显示、
+用外接键盘的热键一键拉起/一键退回后台、进入全屏时暂停其它媒体并播报
+“请小心驾驶”的内置提示音。
+
+关键点（最容易跑偏的地方）：
+- 不用系统 Camera2，也不依赖“外接相机”支持，走 libuvc 直接读 USB 视频流。
+- 不用任何 Material / AppCompat 的 UI 组件，界面全部用 Kotlin 代码搭。
+- 全局热键依赖“无障碍服务”，这是 Android 上唯一免 root 的后台收键方案。
+- 悬浮窗依赖“显示在其他应用上层”权限 + 前台服务常驻。
+- 默认横屏（sensorLandscape）。
+
+
+================================================================
+1. 产品目标与使用场景
+================================================================
+1.1 目标用户
+    车载（车机/平板）场景为主，其次为工业现场、门店监控。
+1.2 典型使用流程
+    a) 车机开机，插着 USB 摄像头和 USB 键盘。
+    b) 平时在跑导航/桌面。
+    c) 按快捷键 F8 → App 被拉起，横屏全屏出画面，同时音乐暂停、
+       播报“请小心驾驶”。
+    d) 看几秒后按退出键 F9 → App 退回后台，导航界面回来，音乐自动续播。
+    e) 也可以开启悬浮窗，让摄像头小窗浮在导航上层长时间显示。
+1.3 非目标（明确不做）
+    - 不做云端推流、不做人脸识别、不做视频文件管理界面。
+    - 不做系统相机（Camera2）混合预览。
+
+
+================================================================
+2. 技术选型与硬性约束
+================================================================
+2.1 技术栈（版本已固定，不要随意升级）
+    - 语言：Kotlin 2.0.21
+    - 构建：Gradle 8.9 + Android Gradle Plugin 8.7.3，JDK 17
+    - compileSdk 35 / targetSdk 34 / minSdk 24
+    - 依赖只有一条：
+        implementation 'com.herohan:UVCAndroid:1.0.13'
+      来源 Maven Central（不需要 JitPack），内部是 libuvc + libusb
+      + libjpeg-turbo，Apache-2.0。
+    - 仓库里没有 gradle-wrapper.jar（二进制文件），CI 里手动装 Gradle 8.9。
+
+2.2 硬性约束（违反会导致编译失败或行为偏差）
+    - 不要引入 Material Components / ViewBinding / Compose / Fragment。
+      所有界面用 android.* 原生控件在 Kotlin 里 new 出来。
+    - Activity 继承 android.app.Activity（不是 AppCompatActivity）。
+    - 主题用 @android:style/Theme.Material.NoActionBar。
+    - 包名 / namespace / applicationId 都是 com.usbcam，不要改。
+    - 不要引用 Android 的 @hide 常量（例如 KeyEvent.META_MODIFIER_MASK），
+      公开 SDK 里没有，编译必失败。见第 8 节。
+
+2.3 为什么不用 Camera2（重要背景）
+    Camera2 的外接相机（external camera）只有少数机型的固件支持，
+    绝大多数手机/车机根本不认 UVC 摄像头。libuvc 方案走 USB 原生视频流，
+    兼容性最好，代价是需要自己处理 USB 权限和 isochronous 传输。
+
+
+================================================================
+3. 工程结构（每个文件干什么）
+================================================================
+app/src/main/java/com/usbcam/
+    App.kt                  Application，初始化 UVCUtils
+    MainActivity.kt          全部界面：全屏预览 + 工具条 + 菜单 + 弹窗
+    CameraCore.kt            摄像头唯一持有者（单例），状态机 + 拍照 + 录像
+    CameraService.kt         前台服务，保活 + 常驻通知
+    FloatWindow.kt           悬浮窗（WindowManager + 拖动 + 双指缩放）
+    HotkeyService.kt         无障碍服务，全局键盘热键
+    BootReceiver.kt          开机广播，只发一条“已就绪”通知
+    DrivingAudio.kt          音频焦点（暂停/恢复媒体）+ 播报提示音
+    DrivePlayer.kt           播放 res/raw/drive_warning.* 内置音频
+    Prefs.kt                 SharedPreferences 封装
+    AppState.kt              前后台状态 + moveTaskToBack 退出
+    MediaStoreExport.kt      把文件复制进系统相册
+
+app/src/main/res/
+    raw/drive_warning.mp3            内置提示音（用户提供的录音）
+    xml/accessibility_service_config.xml  无障碍服务配置
+    xml/device_filter.xml            USB 插入时只对视频类设备弹本应用
+    drawable/ic_launcher.xml         矢量图标
+    values/strings.xml, themes.xml
+
+根目录：
+    settings.gradle / build.gradle / gradle.properties / app/build.gradle
+    .github/workflows/build-apk.yml  云端构建
+    README.md                        使用说明
+    CHANGELOG.md                     版本记录
+    design/menu-preview.html         界面原型（浏览器打开）
+
+
+================================================================
+4. 需求全清单（按版本，含行为契约）
+================================================================
+----------------------------------------------------------------
+4.1 v1.0 基础功能（已完成）
+----------------------------------------------------------------
+需求 1：实时预览
+    实现：CameraCore.onCameraOpen → helper.startPreview()，
+          MainActivity 的 AspectRatioTextureView 作为输出面。
+    契约：插入摄像头后自动申请 USB 权限并出画面，不需要手动点“打开”。
+
+需求 2：拍照
+    实现：CameraCore.takePhoto() → IImageCapture.OutputFileOptions.Builder(File)
+          → helper.takePicture(...)，JPEG 质量 95。
+    契约：文件先写 App 私有目录 Android/data/com.usbcam/files/Pictures/USBCam，
+          Android 10+ 再复制进相册 Pictures/USBCam。
+
+需求 3：录像
+    实现：CameraCore.startRecording()，H.264 + AAC，
+          码率 12Mbps、30fps、关键帧 1 秒。
+    契约：没有麦克风权限时自动录无声视频（setAudioCaptureEnable(false)）。
+          文件进 Movies/USBCam。
+
+需求 4：分辨率 / 格式切换
+    实现：菜单“分辨率 / 格式” → 列出 MJPEG/YUYV × 分辨率 × 帧率，
+          选中后 stopPreview → setPreviewSize → startPreview（热切换）。
+    契约：必须列出摄像头真实上报的能力（来自 getSupportedFormatList），
+          不要自己写死列表。
+
+需求 5：旋转 / 镜像
+    实现：CameraPreviewConfig.setRotation(0/90/180/270)、setMirror(...)。
+    契约：旋转每次 +90°，镜像按 关→水平→垂直 循环。
+
+需求 6：多摄像头
+    实现：菜单“摄像头”列出所有 UVC 设备，切换时 CameraCore.switchTo()
+          （先 close，等 onCameraClose 回调再 open，避免竞态）。
+
+----------------------------------------------------------------
+4.2 v2.0 全屏 / 菜单 / 悬浮窗 / 热键（已完成）
+----------------------------------------------------------------
+需求 7：启动即全屏（横屏）
+    实现：Manifest 中 android:screenOrientation="sensorLandscape"；
+          applyImmersive() 用 SYSTEM_UI_FLAG_* 隐藏状态栏和导航栏。
+    契约：任何时候回到前台都重新进入沉浸式；不要出现系统栏常驻。
+
+需求 8：轻点屏幕出控件，3 秒自动淡出
+    实现：全屏铺一层透明 tapLayer，点一下 showControls()，
+          handler.postDelayed(hide, 3000)；再点一下收起。
+    契约：菜单打开时控件不能自动隐藏；关菜单后回到“纯净画面”。
+
+需求 9：底部上拉菜单，收纳全部功能
+    实现：自绘 ScrollView + LinearLayout 面板，高度 = 屏幕高度 72%，
+          从底部弹出，背后有一层半透明 scrim，点 scrim 关闭。
+    菜单结构（顺序不可随意打乱）：
+        画面：分辨率/格式、旋转、镜像、摄像头
+        窗口：悬浮窗、后台常驻
+        键盘快捷键：快捷键开关、启动快捷键、退出快捷键、无障碍服务
+        驾驶：语音提醒
+        其他：开机自启、关于、退出
+
+需求 10：悬浮窗
+    实现：FloatWindow，TYPE_APPLICATION_OVERLAY，
+          FLAG_NOT_FOCUSABLE | FLAG_HARDWARE_ACCELERATED。
+    契约：只显示画面 + 右上角关闭按钮；单指拖动、双指缩放；
+          位置和大小存 Prefs（float_x/float_y/float_w）下次恢复；
+          默认宽度 180dp，限幅 120~520dp，保持 16:9。
+
+需求 11：全局热键
+    实现：HotkeyService（AccessibilityService），运行时设置
+          FLAG_REQUEST_FILTER_KEY_EVENTS，XML 里 canRequestFilterKeyEvents=true。
+    契约：App 在前台时按“退出键”→ moveTaskToBack(true)；
+          App 不在前台时按“启动键”→ startActivity 全屏。
+          两个键各自匹配 keyCode + Ctrl/Alt/Shift 组合。
+
+需求 12：前台服务保活
+    实现：CameraService，startForeground 带类型 camera|microphone。
+    契约：只有在拿到 CAMERA 权限后才允许启动该服务（Android 14 限制）；
+          启动失败必须 try/catch + stopSelf，不能崩。
+
+需求 13：开机自启
+    实现：BootReceiver 监听 BOOT_COMPLETED / MY_PACKAGE_REPLACED。
+    契约：开机只发一条通知（“USB 摄像头已就绪”），
+          不直接启动相机（Android 14 后台启动相机类前台服务会被拦）。
+
+----------------------------------------------------------------
+4.3 v2.1 双热键 / 自动开 / 驾驶提示（已完成）
+----------------------------------------------------------------
+需求 14：独立的“退出快捷键”
+    实现：Prefs 里 hotkey_open_code/mods 与 hotkey_close_code/mods 两套；
+          菜单两行分别绑定；绑定弹窗 10 秒倒计时。
+    契约：两个键不能相同（相同时提示“和启动键相同，请换一个”）；
+          旧版本 hotkey_code 自动迁移为启动键；
+          绑定期间 HotkeyService.paused=true，避免按键把界面切走。
+
+需求 15：默认自动打开第一个摄像头
+    实现：MainActivity.tryOpenDevice()（最多重试 10 次 × 400ms）
+          + CameraCore.onAttach 触发 notifyChanged → scheduleAutoOpen。
+    契约：CameraCore.devices() 必须按 USB Video Class（interfaceClass==14）
+          过滤，避免把 USB 键盘当摄像头；过滤为空时退回原始列表。
+          多摄像头默认第一台，菜单仍可切换。
+
+需求 16：进全屏暂停其它媒体 + 语音提醒
+    实现：DrivingAudio.enter()：requestAudioFocus(AUDIOFOCUS_GAIN)
+          → 播提示音；exit()：release + abandonAudioFocus。
+    契约：菜单“语音提醒”开关（Prefs.voice_enabled，默认开）关闭后
+          仍然暂停媒体，只是不播报。
+
+----------------------------------------------------------------
+4.4 v2.2 内置音频 / 恢复播放（已完成）
+----------------------------------------------------------------
+需求 17：提示音改成内置 mp3
+    实现：DrivePlayer 用
+          getIdentifier("drive_warning", "raw", packageName) 找资源，
+          MediaPlayer.create(...) 播放；找不到才回退系统 TTS。
+    契约：音频文件是 app/src/main/res/raw/drive_warning.mp3（用户录音）。
+          用 getIdentifier 而不是 R.raw 引用，保证“没有音频文件”时也能编译。
+          CI 的 espeak 生成步骤检测到该文件存在就跳过。
+
+需求 18：退出后台恢复播放
+    实现：进入前记录 AudioManager.isMusicActive；
+          exit() 时若之前确实在放音乐：abandonAudioFocus 后延迟 500ms
+          调用 dispatchMediaKeyEvent(KEYCODE_MEDIA_PLAY)。
+    契约：没在放音乐时绝不能乱发 MEDIA_PLAY（会误唤醒播放器）。
+
+----------------------------------------------------------------
+4.5 v2.3 拉伸铺满（已完成）
+----------------------------------------------------------------
+需求 19：拉伸铺满全屏开关
+    实现：菜单「画面 → 拉伸铺满」开关（addSwitchRow，位于镜像之后、摄像头之前）；
+          MainActivity.applyPreviewLayout()：
+            开启 → 预览层 MATCH_PARENT×MATCH_PARENT，并 setAspectRatio(0.0)
+                    （宽高比 0 表示不再修正尺寸，TextureView 会把画面拉伸到视图大小）；
+            关闭 → 恢复 MATCH_PARENT×WRAP_CONTENT + 按摄像头分辨率 setAspectRatio。
+          状态存 Prefs.fill_screen（默认 false），冷启动时在 onCreate 里恢复。
+    契约：a) 铺满状态下切换分辨率不得把画面改回等比（showFormatDialog 里已加 !fillScreen 判断）；
+          b) 铺满是“拉伸”，会有形变，不要改成裁剪（crop），除非用户另行要求；
+          c) 关闭开关必须立刻恢复等比 + 黑边，不需要重开摄像头。
+
+
+================================================================
+5. 交互与界面规范
+================================================================
+5.1 主界面元素
+    - 预览：AspectRatioTextureView，宽度铺满，按摄像头比例居中。
+    - 左上状态胶囊（仅在控件显示时出现）：
+      “设备名 · 1280×720 MJPEG” 或 “正在连接摄像头…” / “未连接 · 等待 USB 摄像头”。
+    - 顶部中间录像徽标：“● 00:00:00”，红色，录像时才出现。
+    - 底部工具条（点屏幕才出现）：📷拍照 | ⏺录像 | ⌨快捷键 | ≡菜单。
+    - 底部提示文字：“轻点屏幕显示控件”（未连接/无画面时显示）。
+5.2 颜色与视觉
+    - 背景纯黑 #000000；主色蓝 #2F6BFF；录制红 #E5484D；
+      文字 #EEF2F7；次要文字 #8E9BAD。
+    - 圆角胶囊式按钮，半透明深色底。
+5.3 菜单行规范
+    每行：图标（28dp 圆角方块，蓝底 15%）+ 标题（13.5sp）
+         + 右侧当前值（11.5sp 灰色）+ “›”箭头。
+    开关行：右侧显示“开/关”胶囊，开启为蓝色。
+5.4 绑定弹窗
+    - 标题随目标变化：“请按下「启动全屏」的按键” / “请按下「退出后台」的按键”。
+    - 副标题：“10 秒内按下一个键（可配合 Ctrl / Alt / Shift）”。
+    - 中间大号数字倒计时 10 → 0，超时自动取消。
+    - 排除：返回键、音量加、音量减。
+
+
+================================================================
+6. 关键实现细节（照抄，勿“优化”）
+================================================================
+6.1 音频焦点（DrivingAudio.kt）
+    - 请求：AUDIOFOCUS_GAIN（不是 TRANSIENT），API 26+ 用 AudioFocusRequest。
+    - 记录 pausedMusic = am.isMusicActive（请求前读取）。
+    - 退出：abandonAudioFocus(+Request)，若 pausedMusic 为真，
+      500ms 后发 KEYCODE_MEDIA_PLAY 的 DOWN/UP 两个 KeyEvent。
+    - 播放顺序：抢焦点 → DrivePlayer.play() → 失败才 TTS。
+
+6.2 热键（HotkeyService.kt）
+    - onKeyEvent 只处理 ACTION_DOWN 且 repeatCount==0。
+    - 修饰键用 event.isCtrlPressed / isAltPressed / isShiftPressed
+      拼成 KeyEvent.META_CTRL_ON 等，与 Prefs 存的 mods 比较。
+    - 启动：Intent(this, MainActivity::class.java)
+        .addFlags(NEW_TASK | REORDER_TO_FRONT | SINGLE_TOP)，startActivity。
+    - 退出：AppState.hideToBackground() → Activity.moveTaskToBack(true)。
+
+6.3 摄像头生命周期（CameraCore.kt）
+    - 状态：IDLE / OPENING / PREVIEW / ERROR。
+    - 输出面用 Map<String, SurfaceTexture> 管理，key 取 "activity" / "float"，
+      两个面可以同时挂载（App 前台 + 悬浮窗）。
+    - 打开流程：selectDevice → onDeviceOpen → openCamera()
+                → onCameraOpen → startPreview() → 给所有已登记的面 addSurface。
+    - 切换设备：switchTo() 先 close，onCameraClose 里再 open(pendingDevice)。
+    - Activity onStop：若没开悬浮窗 → 停录像 + close()（省电、释放 USB）；
+      开着悬浮窗 → 摄像头保持出流。
+
+6.4 悬浮窗（FloatWindow.kt）
+    - 窗口类型：API 26+ 用 TYPE_APPLICATION_OVERLAY，否则 TYPE_PHONE（已废弃）。
+    - 触摸：ScaleGestureDetector 处理双指缩放；单指算 rawX/rawY 增量移动。
+    - 关闭：右上角 “×”，hide() 里 removeView + 若 App 不在前台则 close 摄像头。
+
+6.5 媒体保存（MediaStoreExport.kt）
+    - Android 10+：ContentResolver.insert + RELATIVE_PATH
+      （Pictures/USBCam、Movies/USBCam）+ IS_PENDING 1→0，成功后删源文件。
+    - Android 10 以下：不做处理，文件留在 App 私有目录。
+
+6.6 构建期生成语音（可选兜底）
+    - CI 步骤 “生成内置语音”：若 res/raw 下没有 drive_warning.*，
+      则 apt 装 espeak-ng 并合成一段 wav。
+    - 现在仓库里有 mp3，这一步会自动跳过。
+
+
+================================================================
+7. 构建与发布
+================================================================
+7.1 云端构建（唯一在用的方式）
+    .github/workflows/build-apk.yml 步骤：
+      1) checkout
+      2) setup-java 17 (temurin)
+      3) 用运行器自带 Android SDK：
+         SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+         sdkmanager --licenses（yes 管道）
+         sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      4) 下载 Gradle 8.9 到 $RUNNER_TEMP，写进 GITHUB_PATH
+      5) （可选）espeak 生成提示音
+      6) gradle :app:assembleDebug --no-daemon
+      7) upload-artifact：name=usbcam-debug-apk，
+         path=**/build/outputs/apk/debug/*.apk
+    产物：GitHub Actions 运行页最底部 Artifacts → 下载 zip → 里面 app-debug.apk。
+
+7.2 重要：不要用 android-actions/setup-android@v3
+    它内部会执行 `sdkmanager tools`，新版 cmdline-tools 已删除 tools 包，
+    必然报 “Failed to find package 'tools'” 并让整个 job 失败。
+    必须用 7.1 第 3 步的手动方式。
+
+7.3 仓库与上传的两个坑
+    - Windows 资源管理器默认隐藏以点开头的文件夹，拖拽上传会丢掉 .github，
+      导致 Actions 一直显示 “Get started with GitHub Actions” 页面。
+      解决办法：在网页上 Add file → Create new file，
+      文件名填 .github/workflows/build-apk.yml，粘贴内容后提交（只需一次）。
+    - 仓库里没有 gradle-wrapper.jar，本地用 Android Studio 打开时
+      需要指定本地 Gradle 8.9+，或先执行 gradle wrapper。
+    - 每次改代码只需拖 app 文件夹覆盖，工作流不用再动。
+
+7.4 本地构建（不推荐，环境需自行准备）
+    JDK 17 + Android SDK Platform 35 + Build-Tools 35.0.0 + Gradle 8.9。
+
+
+================================================================
+8. 踩过的坑（换 AI 后极可能重犯，务必先读）
+================================================================
+坑 1：setup-android@v3 编译前就失败
+    现象：sdkmanager 报 Failed to find package 'tools'。
+    原因：该 action 内部执行 sdkmanager tools。
+    修复：删掉该 action，改用手动 sdkmanager（见 7.1）。
+
+坑 2：Kotlin 找不到 ImageCapture.OutputFileOptions
+    现象：Unresolved reference 'OutputFileOptions' / 'OnImageCaptureCallback'。
+    原因：Java 允许通过子类型访问接口的嵌套类，Kotlin 不继承嵌套类。
+    修复：写成 IImageCapture.OutputFileOptions、
+          IImageCapture.OnImageCaptureCallback、IImageCapture.OutputFileResults。
+
+坑 3：KeyEvent.META_MODIFIER_MASK 编译不过
+    现象：Unresolved reference 'META_MODIFIER_MASK'。
+    原因：Android 的 @hide 常量，公开 SDK 里没有。
+    修复：用 event.isCtrlPressed / isAltPressed / isShiftPressed 自己拼。
+
+坑 4：Actions 一直是 “Get started” 页面
+    原因：仓库里没有 .github/workflows（拖拽上传丢了隐藏目录）。
+    修复：网页新建该文件一次即可（见 7.3）。
+
+坑 5：退出后音乐不续播
+    原因：只 abandon 焦点，部分车机播放器不会自动恢复。
+    修复：记录 isMusicActive，退出时补发 KEYCODE_MEDIA_PLAY。
+
+坑 6：espeak 生成的中文很机械
+    修复：改用用户录音 res/raw/drive_warning.mp3，CI 检测到文件就跳过合成。
+
+坑 7：Android 14 启动前台服务崩溃
+    原因：camera 类型的 FGS 要求已授予 CAMERA 权限；
+          microphone 类型要求 RECORD_AUDIO。
+    修复：只在有权限时启动；startForeground 的 types 按权限按位拼；
+          整个调用包 try/catch，失败 stopSelf。
+
+坑 8：切换摄像头点了没反应
+    原因：closeCamera 是异步的，紧接着 open 会被状态机挡掉。
+    修复：switchTo() 记 pendingDevice，在 onCameraClose 回调里再 open。
+
+坑 9：USB 键盘被当成摄像头
+    修复：devices() 按 interfaceClass==14 过滤，过滤为空才退回原列表。
+
+
+================================================================
+9. 代码约定（Do / Don't）
+================================================================
+DO
+    - 新增界面元素：在 MainActivity.buildUi() 里用代码创建并 addView。
+    - 新增菜单项：在 buildMenu() 里用 addRow / addSwitchRow。
+    - 新增持久化：统一加到 Prefs.kt，键名用下划线小写。
+    - 新增摄像头能力：放在 CameraCore，界面只调用它。
+    - 所有摄像头/媒体回调都 post 到主线程再更新 UI。
+
+DON'T
+    - 不要引入任何新依赖（尤其是 UI 库、协程库、图片库）。
+    - 不要把 CameraHelper 放到 Activity 里（会导致后台/悬浮窗失效）。
+    - 不要用 R.raw.xxx 直接引用音频（文件缺失会导致编译失败），
+      必须用 resources.getIdentifier。
+    - 不要改包名、applicationId、主题，否则用户已授权的无障碍服务会失效。
+    - 不要在 onStop 里关闭摄像头（有悬浮窗时不能让流断掉）。
+    - 不要用 MaterialAlertDialog / AppCompat 主题。
+
+
+================================================================
+10. 验收清单（改完必须逐条过）
+================================================================
+[ ] 冷启动：横屏全屏，无系统栏，提示“轻点屏幕显示控件”
+[ ] 插摄像头：自动出画面，左上角显示 “设备名 · 宽×高 MJPEG”
+[ ] 点屏幕：工具条出现，3 秒无操作自动消失
+[ ] 拍照：相册 Pictures/USBCam 出现 JPG
+[ ] 录像：红点计时，停止后 Movies/USBCam 出现 MP4，声音正常
+[ ] 菜单 → 分辨率：能列真实能力，切换后画面比例正确
+[ ] 菜单 → 旋转/镜像：画面立即变化
+[ ] 菜单 → 拉伸铺满：开启后画面铺满整屏（形变属正常），关闭后恢复等比黑边，重启后状态保持
+[ ] 菜单 → 悬浮窗：授权后出现小窗，可拖可缩放，点 × 关闭
+[ ] 菜单 → 启动快捷键：10 秒内按 F8 绑定成功
+[ ] 菜单 → 退出快捷键：10 秒内按 F9 绑定成功
+[ ] 前台按 F9：退回后台；后台按 F8：拉起全屏
+[ ] 放音乐 → 按 F8：音乐停 + 听到用户录音“请小心驾驶”
+[ ] 按 F9：回到原界面，音乐继续播放
+[ ] 菜单 → 关闭语音提醒：按 F8 只有暂停媒体，无播报
+[ ] 菜单 → 关于：显示 v2.3、当前提醒音：内置语音
+
+
+================================================================
+11. 待办 / 可扩展（用户尚未提出，供参考）
+================================================================
+- 录像时加水印/时间戳。
+- 手动对焦、曝光、亮度（UVCControl 已可用，未做 UI）。
+- 悬浮窗内加拍照/录像按钮。
+- 多摄像头同时预览（libuvc 支持多路，但 USB 带宽是瓶颈）。
+- 设置项持久化到云端/导入导出。
+- 横竖屏切换支持（当前锁定 sensorLandscape）。
+
+
+================================================================
+12. 给接手 AI 的开场提示词（可直接复制粘贴）
+================================================================
+你是安卓开发工程师。请接着开发一个已有的 USB（UVC）摄像头 App 工程。
+
+工程事实（务必遵守，不要自行更改）：
+- 包名 com.usbcam；Kotlin 2.0.21；Gradle 8.9；AGP 8.7.3；
+  compileSdk 35 / targetSdk 34 / minSdk 24。
+- 唯一依赖：com.herohan:UVCAndroid:1.0.13（Maven Central）。
+- 不用 Material / AppCompat / Compose / ViewBinding / Fragment，
+  界面全部用 android.* 原生控件在 Kotlin 代码里创建。
+- 架构：CameraCore（单例，唯一持有 CameraHelper）+ CameraService（前台服务）
+  + FloatWindow（悬浮窗）+ HotkeyService（无障碍热键）
+  + DrivingAudio / DrivePlayer（音频焦点与提示音）+ Prefs（配置）。
+- 默认横屏沉浸式全屏；点屏幕出工具条，3 秒淡出；功能都在底部上拉菜单里。
+- 摄像头退出后台时：无悬浮窗则停流释放 USB，有悬浮窗则保持出流。
+
+必须避开的坑：
+1. 不要用 android-actions/setup-android@v3（会执行 sdkmanager tools 而失败）。
+2. Kotlin 不继承 Java 接口的嵌套类：必须写 IImageCapture.OutputFileOptions，
+   不能写 ImageCapture.OutputFileOptions。
+3. 不要用 KeyEvent.META_MODIFIER_MASK（@hide），用 isCtrlPressed/isAltPressed/isShiftPressed。
+4. 不要用 R.raw.drive_warning 直接引用（可能不存在），用 getIdentifier。
+5. 不要引入新依赖，不要改包名/主题/applicationId。
+
+输出要求：只给改动文件的完整代码 + 需要替换的片段；
+涉及构建配置时，同时给出对应的 GitHub Actions 修改。
+改动前先说明会改哪几个文件、为什么。
+
+================================================================
+（完）
+================================================================
